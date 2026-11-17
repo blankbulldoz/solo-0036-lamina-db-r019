@@ -176,6 +176,10 @@ func (d *DB) Commit(id string) (Commit, error) {
 			d.conflicts++
 			return Commit{}, err
 		}
+		if err = d.rowChecks(table, tx.writes); err != nil {
+			d.conflicts++
+			return Commit{}, err
+		}
 	}
 	if len(writes) == 0 {
 		return Commit{Sequence: tx.Snapshot}, nil

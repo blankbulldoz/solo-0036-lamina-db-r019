@@ -85,6 +85,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET "+p+"/catalog", s.catalog)
 	s.mux.HandleFunc("POST "+p+"/relations", s.createRelation)
 	s.mux.HandleFunc("POST "+p+"/indexes", s.createIndex)
+	s.mux.HandleFunc("POST "+p+"/checks", s.createCheck)
 	s.mux.HandleFunc("POST "+p+"/transactions", s.begin)
 	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/put", s.put)
 	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/delete", s.deleteRow)

@@ -13,6 +13,16 @@ import (
 
 const MaxImage = 128 << 20
 
+// Image payload formats. FormatLegacy (1) predates row checks: its catalog
+// cannot declare checks, and it is restored explicitly with zero declared
+// checks rather than being reinterpreted under any current declarations.
+// FormatCurrent (2) catalogs may declare checks; every retained version
+// still readable within a check's effective scope is validated on decode.
+const (
+	FormatLegacy  = 1
+	FormatCurrent = 2
+)
+
 type Image struct {
 	Format   int              `json:"format"`
 	Sequence uint64           `json:"sequence"`
@@ -27,7 +37,9 @@ type Envelope struct {
 }
 
 func Encode(image Image) ([]byte, error) {
-	image.Format = 1
+	if image.Format != FormatLegacy && image.Format != FormatCurrent {
+		return nil, fmt.Errorf("image format must be %d or %d", FormatLegacy, FormatCurrent)
+	}
 	b, err := json.Marshal(image)
 	if err != nil {
 		return nil, err
@@ -54,6 +66,11 @@ func Decode(b []byte) (Image, error) {
 	if err := Validate(image); err != nil {
 		return image, err
 	}
+	if image.Catalog.Checks == nil {
+		// Legacy images carry no declarations; normalize to an explicit
+		// empty set so replay can append new declarations.
+		image.Catalog.Checks = map[string]catalog.Check{}
+	}
 	return image, nil
 }
 func Read(path string) (Image, error) {
@@ -69,7 +86,16 @@ func Read(path string) (Image, error) {
 	return Decode(b)
 }
 func Validate(image Image) error {
-	if image.Format != 1 || image.Horizon > image.Sequence || image.Catalog == nil || image.Store == nil || image.Catalog.Relations == nil || image.Catalog.Indexes == nil || image.Store.Tables == nil {
+	if image.Format != FormatLegacy && image.Format != FormatCurrent {
+		return fmt.Errorf("invalid image header")
+	}
+	if image.Horizon > image.Sequence || image.Catalog == nil || image.Store == nil || image.Catalog.Relations == nil || image.Catalog.Indexes == nil || image.Store.Tables == nil {
+		return fmt.Errorf("invalid image header")
+	}
+	if image.Format == FormatLegacy && len(image.Catalog.Checks) > 0 {
+		return fmt.Errorf("format %d image cannot declare checks", FormatLegacy)
+	}
+	if image.Format == FormatCurrent && image.Catalog.Checks == nil {
 		return fmt.Errorf("invalid image header")
 	}
 	for name, r := range image.Catalog.Relations {
@@ -87,6 +113,15 @@ func Validate(image Image) error {
 		}
 		if _, ok := relation.Column(definition.Column); !ok {
 			return fmt.Errorf("invalid index column")
+		}
+	}
+	for name, definition := range image.Catalog.Checks {
+		relation, ok := image.Catalog.Relations[definition.Relation]
+		if !ok || name != definition.Name || !catalog.ValidName(name) || definition.Created < relation.Created || definition.Created > image.Sequence {
+			return fmt.Errorf("invalid check metadata")
+		}
+		if err := definition.Validate(relation); err != nil {
+			return fmt.Errorf("invalid check %s: %w", name, err)
 		}
 	}
 	for name, rows := range image.Store.Tables {
@@ -133,6 +168,38 @@ func Validate(image Image) error {
 			seen[value.Key()] = true
 		}
 	}
+	if err := ValidateChecks(image.Catalog, image.Store, image.Horizon); err != nil {
+		return err
+	}
+	return nil
+}
 
+// ValidateChecks verifies that the durable state satisfies every declared
+// check inside its effective scope. A check created at sequence C governs
+// snapshots at C-1 and later, so the validated set is exactly the retained
+// versions still readable at max(horizon, C-1) or beyond — not every
+// historical version, and not only the latest one. It is used both for
+// image validation and for post-replay recovery checks.
+func ValidateChecks(c *catalog.Catalog, s *versions.Store, horizon uint64) error {
+	for _, definition := range c.CheckList() {
+		chains := s.Tables[definition.Relation]
+		if len(chains) == 0 {
+			continue
+		}
+		start := horizon
+		if definition.Created > 0 && definition.Created-1 > start {
+			start = definition.Created - 1
+		}
+		for key, chain := range chains {
+			for _, v := range versions.ReadableFrom(chain, start) {
+				if v.Deleted {
+					continue
+				}
+				if definition.Violates(v.Row) {
+					return fmt.Errorf("check %s violated by retained row of %s key %s at sequence %d", definition.Name, definition.Relation, key, v.Sequence)
+				}
+			}
+		}
+	}
 	return nil
 }

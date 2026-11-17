@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production walkthroughs using only the public HTTP service."""
-import argparse, concurrent.futures, json, os, pathlib, shutil, socket, subprocess, tempfile, time, urllib.request, urllib.error
-WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics']
+import argparse, concurrent.futures, hashlib, json, os, pathlib, shutil, socket, subprocess, tempfile, time, urllib.request, urllib.error
+WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics','row-checks']
 class Session:
  def __init__(self,binary,root,restore=None):
   self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None
@@ -40,6 +40,9 @@ class Session:
  def stats(self):return self.call('GET','/stats')
 def require(condition,message):
  if not condition:raise RuntimeError(message)
+def wrap_image(payload):
+ raw=json.dumps(payload,separators=(',',':')).encode()
+ return b'{"format":1,"sha256":"'+hashlib.sha256(raw).hexdigest().encode()+b'","payload":'+raw+b'}'
 def tuple_(n,band=None,amplitude=None):return {'sample':n,'band':band or f'b{n}','amplitude':n*10 if amplitude is None else amplitude,'valid':True}
 def seed(s):
  schema={'name':'spectra','primary':'sample','columns':[{'name':'sample','type':'int'},{'name':'band','type':'text'},{'name':'amplitude','type':'int','nullable':True},{'name':'valid','type':'bool'}]}
@@ -152,6 +155,42 @@ def walkthrough(name,binary):
     q=s.query(where=[{'column':'amplitude','op':'>=','value':40}],limit=2)
     require(q['matched']==3 and q['scanned']==3 and len(q['rows'])==2 and q['truncated'],'query fact meanings conflated')
     observations={'query':q,'stats':s.stats()}
+   elif name=='row-checks':
+    tx=s.begin();s.put(tx,tuple_(1,amplitude=-1));bad_seq=s.commit(tx)['sequence']
+    tx=s.begin();s.put(tx,tuple_(1,amplitude=10));s.commit(tx)
+    declared=s.call('POST','/checks',{'name':'amp_floor','relation':'spectra','predicates':[{'column':'amplitude','op':'>=','value':0},{'column':'band','op':'!=','value':''}]},201)
+    require(declared['created']>bad_seq,'check declaration not sequenced')
+    s.call('POST','/checks',{'name':'amp_high','relation':'spectra','predicates':[{'column':'amplitude','op':'>=','value':100}]},409)
+    s.call('POST','/checks',{'name':'bad_op','relation':'spectra','predicates':[{'column':'amplitude','op':'~','value':1}]},400)
+    tx=s.begin();s.put(tx,tuple_(8));s.commit(tx)
+    tx=s.begin();s.put(tx,{'sample':9,'band':'b9','amplitude':-9,'valid':True});s.put(tx,tuple_(9));s.commit(tx)
+    require(s.query(where=[{'column':'sample','op':'=','value':9}])['rows'][0]['amplitude']==90,'final staged row not published')
+    tx=s.begin();s.put(tx,{'sample':10,'band':'b10','amplitude':-10,'valid':True});s.commit(tx,409);s.commit(tx,404)
+    require(s.query(where=[{'column':'sample','op':'=','value':10}])['matched']==0,'violating row published')
+    tx=s.begin();s.put(tx,{'sample':11,'band':'b11','amplitude':None,'valid':False});s.commit(tx)
+    require(s.query(at=bad_seq,where=[{'column':'sample','op':'=','value':1}])['rows'][0]['amplitude']==-1,'pre-declaration snapshot rewritten')
+    require(any(c['name']=='amp_floor' for c in s.call('GET','/catalog')['checks']),'check missing from catalog')
+    backup=s.call('GET','/backup',raw=True);payload=json.loads(backup)['payload']
+    good=temp/'checked.lmi';good.write_bytes(backup)
+    other=Session(binary,temp/'checked-restore',good).start()
+    tx=other.begin();other.put(tx,{'sample':12,'band':'b12','amplitude':-12,'valid':True});other.commit(tx,409)
+    require(other.query(at=bad_seq,where=[{'column':'sample','op':'=','value':1}])['rows'][0]['amplitude']==-1,'restored history diverged')
+    other.stop()
+    tampered=json.loads(json.dumps(payload));tampered['store']['tables']['spectra']['int:2'][-1]['row']['amplitude']=-500
+    bad=temp/'tampered.lmi';bad.write_bytes(wrap_image(tampered))
+    failed=subprocess.run([str(binary),'-restore',str(bad),'-data',str(temp/'tampered-out')],capture_output=True,text=True,timeout=5)
+    require(failed.returncode!=0 and 'amp_floor' in failed.stderr and not (temp/'tampered-out').exists(),'image contradicting its checks installed')
+    legacy=json.loads(json.dumps(payload));legacy['format']=1;del legacy['catalog']['checks']
+    old=temp/'legacy.lmi';old.write_bytes(wrap_image(legacy))
+    prior=Session(binary,temp/'legacy-restore',old).start()
+    require(prior.call('GET','/catalog')['checks']==[],'legacy image gained declarations')
+    tx=prior.begin();prior.put(tx,{'sample':12,'band':'b12','amplitude':-12,'valid':True});prior.commit(tx)
+    prior.stop()
+    smuggled=json.loads(json.dumps(payload));smuggled['format']=1
+    sneak=temp/'smuggled.lmi';sneak.write_bytes(wrap_image(smuggled))
+    refused=subprocess.run([str(binary),'-restore',str(sneak),'-data',str(temp/'smuggled-out')],capture_output=True,text=True,timeout=5)
+    require(refused.returncode!=0 and not (temp/'smuggled-out').exists(),'format 1 image with checks accepted')
+    observations={'check':declared['name'],'created':declared['created'],'tampered':'rejected','legacy':'zero declarations','smuggled':'rejected'}
    else:raise ValueError(name)
    return {'workflow':name,'status':'observed','observations':observations}
   finally:

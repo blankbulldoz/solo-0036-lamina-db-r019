@@ -45,6 +45,26 @@ func Visible(chain []Version, at uint64) (Version, bool) {
 	v := chain[lo-1]
 	return v, !v.Deleted
 }
+
+// ReadableFrom returns the retained suffix of a chain that can still be
+// visible at sequence `at` or later: the version visible at `at` (if any)
+// plus every newer version. Earlier retained versions can never be served
+// at `at` or beyond, so scoped validation does not need to inspect them.
+func ReadableFrom(chain []Version, at uint64) []Version {
+	lo, hi := 0, len(chain)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if chain[mid].Sequence <= at {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo > 0 {
+		lo--
+	}
+	return chain[lo:]
+}
 func (s *Store) Read(table, key string, at uint64) (datum.Row, bool) {
 	v, ok := Visible(s.Tables[table][key], at)
 	return datum.Clone(v.Row), ok

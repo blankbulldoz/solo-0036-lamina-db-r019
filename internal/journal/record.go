@@ -12,6 +12,7 @@ type Record struct {
 	Transaction string              `json:"transaction,omitempty"`
 	Relation    *catalog.Relation   `json:"relation,omitempty"`
 	Index       *catalog.Index      `json:"index,omitempty"`
+	Check       *catalog.Check      `json:"check,omitempty"`
 	Writes      []versions.Mutation `json:"writes,omitempty"`
 	Horizon     uint64              `json:"horizon,omitempty"`
 }

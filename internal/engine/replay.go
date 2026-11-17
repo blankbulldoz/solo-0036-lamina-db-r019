@@ -31,6 +31,14 @@ func (d *DB) apply(r journal.Record) error {
 			return err
 		}
 		d.catalog.Indexes[r.Index.Name] = *r.Index
+	case "check":
+		if r.Check == nil || r.Check.Created != r.Sequence {
+			return fmt.Errorf("invalid check record")
+		}
+		if err := d.catalog.ValidateCheck(*r.Check); err != nil {
+			return err
+		}
+		d.catalog.Checks[r.Check.Name] = *r.Check
 	case "commit":
 		seen := map[string]bool{}
 		for _, m := range r.Writes {

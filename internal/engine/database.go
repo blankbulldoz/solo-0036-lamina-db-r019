@@ -7,6 +7,7 @@ import (
 	"lamina/internal/journal"
 	"lamina/internal/snapshot"
 	"lamina/internal/versions"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -49,6 +50,9 @@ func Open(dir string) (*DB, error) {
 	}
 	d := &DB{dir: absolute, catalog: catalog.New(), store: versions.New(), wal: w, transactions: map[string]*Transaction{}}
 	if !missing {
+		if image.Format == snapshot.FormatLegacy {
+			slog.Info("checkpoint image format 1 predates row checks; catalog carries no check declarations")
+		}
 		d.catalog = image.Catalog
 		d.store = image.Store
 		d.sequence = image.Sequence
@@ -74,6 +78,10 @@ func Open(dir string) (*DB, error) {
 			w.Close()
 			return nil, fmt.Errorf("recovered constraints: %w", err)
 		}
+	}
+	if err = snapshot.ValidateChecks(d.catalog, d.store, d.horizon); err != nil {
+		w.Close()
+		return nil, fmt.Errorf("recovered constraints: %w", err)
 	}
 	return d, nil
 }
@@ -111,11 +119,11 @@ func (d *DB) publish(r journal.Record) error {
 	}
 	return nil
 }
-func (d *DB) Relations() ([]catalog.Relation, []catalog.Index, error) {
+func (d *DB) Relations() ([]catalog.Relation, []catalog.Index, []catalog.Check, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	if err := d.usable(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return d.catalog.List(), d.catalog.IndexList(), nil
+	return d.catalog.List(), d.catalog.IndexList(), d.catalog.CheckList(), nil
 }
